@@ -1,0 +1,877 @@
+import os
+import re
+import json
+import time
+import requests
+from typing import Dict, Any, Optional, Tuple, List
+
+from django.conf import settings
+from monashee.apis.S1Prompt import SYSTEM_MESSAGE_QA
+from monashee.apis.red_flag_analysis_prompt import SYSTEM_MESSAGE_REDFLAG_JSON
+from monashee.models import IPOS1DealData
+from monashee_insights.env import PERPLEXITY_API_KEY
+
+from utils.google_drive import *  # noqa
+
+
+# =========================
+# CONFIG
+# =========================
+PERPLEXITY_MODEL: str = "sonar-pro"
+
+# Speed tuning (lower prompt size => faster)
+QA_RETRIEVE_K: int = 10
+QA_SEND_K: int = 4
+# QA_MAX_CHARS_PER_CHUNK: int = 1000
+
+# Perplexity generation control
+PERPLEXITY_TIMEOUT: int = 20
+PERPLEXITY_MAX_TOKENS_QA: int = 900
+PERPLEXITY_MAX_TOKENS_RF: int = 1400
+PERPLEXITY_TEMPERATURE: float = 0.1
+
+# Red-flag retrieval tuning (keep prompt reasonable)
+RF_PER_QUERY_K: int = 10
+RF_MAX_UNIQUE_CHUNKS: int = 30
+RF_MAX_CHARS_PER_CHUNK: int = 900
+
+# FAISS storage directory
+DEFAULT_FAISS_DIR = os.path.join(getattr(settings, "BASE_DIR", "."), "storage", "faiss_s1")
+FAISS_BASE_DIR = getattr(settings, "FAISS_INDEX_DIR", DEFAULT_FAISS_DIR)
+os.makedirs(FAISS_BASE_DIR, exist_ok=True)
+
+if not PERPLEXITY_API_KEY:
+    raise EnvironmentError("PERPLEXITY_API_KEY not set in environment variables.")
+
+
+# =========================
+# LOGGING
+# =========================
+def log(msg: str):
+    print(f"[S1_FAISS] {msg}")
+
+
+log(f"FAISS_BASE_DIR = {FAISS_BASE_DIR}")
+
+
+
+# =========================
+# SYSTEM PROMPT: RED FLAG JSON (STRICT OBJECT)
+# =========================
+
+# =========================
+# CACHES
+# =========================
+_embeddings = None
+_FAISS_CACHE: Dict[str, Any] = {}  # ticker -> FAISS vectorstore
+
+
+# =========================
+# EMBEDDINGS (LAZY)
+# =========================
+def get_embeddings():
+    global _embeddings
+    if _embeddings is None:
+        t0 = time.time()
+        from langchain_huggingface import HuggingFaceEmbeddings
+        _embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        log(f"Embeddings loaded in {time.time() - t0:.2f}s")
+    return _embeddings
+
+
+# =========================
+# PATH HELPERS
+# =========================
+def _ticker_dir(ticker: str) -> str:
+    return os.path.join(FAISS_BASE_DIR, (ticker or "").strip().upper())
+
+
+def _faiss_files(ticker: str) -> Tuple[str, str, str]:
+    d = _ticker_dir(ticker)
+    return d, os.path.join(d, "index.faiss"), os.path.join(d, "index.pkl")
+
+
+def _is_faiss_ready(ticker: str) -> bool:
+    d, f1, f2 = _faiss_files(ticker)
+    ok = os.path.exists(f1) and os.path.exists(f2)
+    log(f"Checking FAISS path for {ticker}: {d}")
+    log(f"  exists index.faiss? {os.path.exists(f1)} -> {f1}")
+    log(f"  exists index.pkl?   {os.path.exists(f2)} -> {f2}")
+    log(f"  READY={ok}")
+    return ok
+
+
+def _normalize_text(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+# =========================
+# PDF -> TEXT
+# =========================
+def _extract_pages_from_pdf_bytes(pdf_bytes: bytes):
+    import fitz  # PyMuPDF
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pages = []
+    for i in range(len(doc)):
+        pages.append({"page": i + 1, "text": doc[i].get_text() or ""})
+    return pages
+
+
+def _build_documents_from_pages(pages):
+    from langchain_core.documents import Document
+    docs = []
+    for p in pages:
+        txt = _normalize_text(p["text"])
+        if not txt:
+            continue
+        docs.append(Document(page_content=txt, metadata={"page": p["page"]}))
+    return docs
+
+
+def _split_documents(docs):
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1400,
+        chunk_overlap=250,
+        separators=["\n\n", "\n", ".", " ", ""],
+    )
+    return splitter.split_documents(docs)
+
+
+# =========================
+# FAISS SAVE / LOAD (CACHED)
+# =========================
+def _save_faiss_index(ticker: str, vectorstore):
+    d = _ticker_dir(ticker)
+    os.makedirs(d, exist_ok=True)
+    vectorstore.save_local(d)
+    log(f"FAISS saved to: {d}")
+    _FAISS_CACHE[(ticker or "").strip().upper()] = vectorstore
+
+
+def _load_faiss_index_cached(ticker: str):
+    from langchain_community.vectorstores import FAISS
+    t = (ticker or "").strip().upper()
+    if t in _FAISS_CACHE:
+        return _FAISS_CACHE[t]
+    vs = FAISS.load_local(_ticker_dir(t), get_embeddings(), allow_dangerous_deserialization=True)
+    _FAISS_CACHE[t] = vs
+    return vs
+
+
+# =========================
+# DB UTIL
+# =========================
+def _get_s1_row(ticker: str):
+    return IPOS1DealData.objects.filter(ticker_name=ticker).first()
+
+
+def _update_drive_link(ticker: str, link: str):
+    IPOS1DealData.objects.filter(ticker_name=ticker).update(s1_document_link=link)
+
+
+# =========================
+# PERPLEXITY CALL
+# =========================
+def _perplexity_call(system_prompt: str, user_prompt: str, *, max_tokens: int) -> str:
+    payload = {
+        "model": PERPLEXITY_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        # "max_tokens": max_tokens,
+        "temperature": PERPLEXITY_TEMPERATURE,
+    }
+
+    t0 = time.time()
+    log(f"Calling Perplexity model={PERPLEXITY_MODEL} (user_chars={len(user_prompt)})")
+    r = requests.post(
+        "https://api.perplexity.ai/chat/completions",
+        json=payload,
+        headers={"Authorization": f"Bearer {PERPLEXITY_API_KEY}", "Content-Type": "application/json"},
+        timeout=PERPLEXITY_TIMEOUT,
+    )
+    log(f"Perplexity HTTP time: {time.time() - t0:.2f}s, status={r.status_code}")
+
+    if r.status_code != 200:
+        raise Exception(f"Perplexity API failed. status={r.status_code}, body={r.text[:1000]}")
+    return r.json()["choices"][0]["message"]["content"]
+
+
+# =========================
+# JSON REPAIR HELPERS
+# =========================
+def _try_repair_json_array(raw: str) -> Optional[list]:
+    if not raw:
+        return None
+    s = raw.strip()
+    start = s.find("[")
+    if start == -1:
+        return None
+    s = s[start:]
+
+    # A) has a closing bracket
+    end = s.rfind("]")
+    if end != -1:
+        try:
+            return json.loads(s[:end + 1])
+        except Exception:
+            pass
+
+    # B) missing closing bracket -> append
+    try:
+        return json.loads(s + "]")
+    except Exception:
+        pass
+
+    # C) trim to last complete object
+    last_obj = s.rfind("}")
+    if last_obj != -1:
+        candidate = s[:last_obj + 1] + "]"
+        try:
+            return json.loads(candidate)
+        except Exception:
+            return None
+    return None
+
+
+def _try_repair_json_object(raw: str) -> Optional[dict]:
+    if not raw:
+        return None
+    s = raw.strip()
+    start = s.find("{")
+    if start == -1:
+        return None
+    s = s[start:]
+    end = s.rfind("}")
+    if end != -1:
+        try:
+            return json.loads(s[:end + 1])
+        except Exception:
+            pass
+    # Try trim to last brace
+    last = s.rfind("}")
+    if last != -1:
+        try:
+            return json.loads(s[:last + 1])
+        except Exception:
+            return None
+    return None
+
+def validate_and_clean_json_array(json_text: str):
+
+    try:
+        #--------------------------------------------
+        extracted = extract_json_substring(json_text)
+        
+        extracted_data = try_and_except(extracted)
+        if extracted_data[0]:
+            return extracted_data[1], []
+        
+        #--------------------------------------------
+        escaped = escape_newlines_inside_strings(extracted)
+        escaped_data = try_and_except(escaped)
+        if escaped_data[0]:
+            return escaped_data[1], []
+
+        #--------------------------------------------
+        data = ast.literal_eval(escaped)
+        literal_data = try_and_except(data)
+        if literal_data[0]:
+            return literal_data[1], []
+        #--------------------------------------------
+    except Exception:
+        return json_text, []  
+
+    if not isinstance(data, list):
+        return json_text, []
+
+    cleaned, skipped = [], []
+
+    for item in data:
+        try:
+            # Convert item → JSON string → Python dict (strict validation)
+            strict_json = json.dumps(item)
+            validated = json.loads(strict_json)
+            cleaned.append(validated)
+        except Exception:
+            skipped.append(item)
+
+    cleaned_data = try_and_except(cleaned)
+    if cleaned_data[0]:
+        return cleaned_data[1], skipped
+    return cleaned, skipped
+
+
+# =========================
+# FALLBACKS
+# =========================
+def _fallback_unknown() -> List[Dict[str, Any]]:
+    return [
+        {
+            "type": "text",
+            "row": 1,
+            "column": 1,
+            "total_columns": 1,
+            "content": "I don’t know the answer from the S-1 context. I am an S-1 Filing AI Assistant. Please ask another question related to this IPO filing."
+        },
+        {
+            "type": "suggested_questions",
+            "questions": [
+                "What are the key risk factors mentioned in this S-1?",
+                "How will the IPO proceeds be used?",
+                "What are the main financial highlights in this filing?"
+            ]
+        }
+    ]
+
+
+def _minimal_ui_accept(arr: Any) -> bool:
+    """
+    Minimal acceptance:
+    - list of dicts
+    - first component is text greeting
+    - at least 1 representation (table/card/chart)
+    """
+    if not isinstance(arr, list) or not arr:
+        return False
+    if not all(isinstance(x, dict) for x in arr):
+        return False
+    if arr[0].get("type") != "text":
+        return False
+    rep_count = sum(1 for x in arr if x.get("type") in ("table", "card", "chart"))
+    if rep_count < 1:
+        return False
+    return True
+
+
+# =========================
+# PUBLIC: UPLOAD + INGEST
+# =========================
+def upload_and_ingest_faiss(ticker: str, uploaded_file):
+    t0 = time.time()
+    ticker = (ticker or "").strip().upper()
+    if not ticker:
+        raise ValueError("ticker is required")
+
+    row = _get_s1_row(ticker)
+    if not row:
+        raise ValueError(f"Ticker '{ticker}' not found in IPOS1DealData")
+
+    pdf_bytes = uploaded_file.read()
+    if not pdf_bytes:
+        raise ValueError("Uploaded file is empty")
+
+    log(f"Uploading to Drive for ticker={ticker} ...")
+
+    class _FakeUploaded:
+        def __init__(self, name, content_type, data):
+            self.name = name
+            self.content_type = content_type
+            self._data = data
+
+        def read(self):
+            return self._data
+
+    fake = _FakeUploaded(
+        name=getattr(uploaded_file, "name", f"{ticker}.pdf"),
+        content_type=getattr(uploaded_file, "content_type", "application/pdf"),
+        data=pdf_bytes,
+    )
+
+    file_id = upload_image_to_drive(fake, filename=f"{ticker}_S1.pdf")
+    link = get_drive_file_link(file_id)
+    _update_drive_link(ticker, link)
+    log(f"Drive link stored in DB: {link}")
+
+    log("Extracting PDF text...")
+    pages = _extract_pages_from_pdf_bytes(pdf_bytes)
+    log(f"Extracted pages={len(pages)}")
+
+    docs = _build_documents_from_pages(pages)
+    log(f"Page docs={len(docs)}")
+
+    chunked_docs = _split_documents(docs)
+    log(f"Chunk docs={len(chunked_docs)}")
+
+    log("Building FAISS index ...")
+    from langchain_community.vectorstores import FAISS
+    vs = FAISS.from_documents(chunked_docs, get_embeddings())
+    _save_faiss_index(ticker, vs)
+
+    log(f"Upload+Ingest done in {time.time() - t0:.2f}s")
+    return {
+        "ticker": ticker,
+        "s1_document_link": link,
+        "status": "READY",
+        "chunks_indexed": len(chunked_docs),
+        "faiss_dir": _ticker_dir(ticker),
+    }
+
+
+# =========================
+# PUBLIC: Q&A
+# =========================
+def answer_question_faiss(ticker: str, question: str):
+    overall_t0 = time.time()
+    ticker = (ticker or "").strip().upper()
+    question = (question or "").strip()
+
+    log("=" * 60)
+    log(f"ASK ticker={ticker}")
+    log(f"Question: {question}")
+
+    if not ticker or not question:
+        return _fallback_unknown()
+
+    row = _get_s1_row(ticker)
+    if not row:
+        return _fallback_unknown()
+
+    s1_link = getattr(row, "s1_document_link", "") or ""
+
+    if not _is_faiss_ready(ticker):
+        return [
+            {
+                "type": "text",
+                "row": 1,
+                "column": 1,
+                "total_columns": 1,
+                "content": f"No FAISS index found for '{ticker}'. Please upload S-1 first using /api/s1/upload/."
+            }
+        ]
+
+    vs = _load_faiss_index_cached(ticker)
+
+    # Retrieve
+    t_retrieve = time.time()
+    hits = vs.similarity_search(question, k=QA_RETRIEVE_K)
+    log(f"Retrieved QA top_k={QA_RETRIEVE_K} in {time.time() - t_retrieve:.2f}s")
+
+    hits_to_send = hits[:]
+    context_blocks = []
+    for i, h in enumerate(hits_to_send, start=1):
+        page = h.metadata.get("page")
+        txt = (h.page_content or "")[:]
+        preview = (txt[:140] + "...") if len(txt) > 140 else txt
+        log(f"  #{i} page={page} preview={preview} -- {len(txt)}")
+        context_blocks.append(f"(Page {page}) {txt}")
+
+    context = "\n\n".join(context_blocks)
+
+    user_prompt = (
+        f"CONTEXT (S-1 excerpts only):\n{context}\n\n"
+        f"QUESTION:\n{question}\n\n"
+        "Return ONLY the JSON ARRAY UI components as instructed."
+    )
+
+    # Try #1
+    raw = _perplexity_call(SYSTEM_MESSAGE_QA, user_prompt, max_tokens=PERPLEXITY_MAX_TOKENS_QA)
+    arr = _try_repair_json_array(raw)
+
+    # Try #2 if parsing failed
+    if arr is None:
+        fix_prompt = user_prompt + "\n\nIMPORTANT: Your previous output was invalid JSON. Return ONLY valid JSON array now."
+        raw2 = _perplexity_call(SYSTEM_MESSAGE_QA, fix_prompt, max_tokens=PERPLEXITY_MAX_TOKENS_QA)
+        arr = _try_repair_json_array(raw2)
+        if arr is None:
+            log("QA invalid JSON after 2 attempts (first 900 chars):")
+            log((raw2 or "")[:900])
+            return _fallback_unknown()
+
+    # Soft enforcement (do NOT reject good answer)
+    # arr = _ensure_suggested_questions_last(arr)
+    # arr = _ensure_drive_link_component(arr, s1_link)
+
+    if not _minimal_ui_accept(arr):
+        log("QA minimal UI acceptance failed. Returning fallback.")
+        log("Model output preview (first 900 chars):")
+        log((raw or "")[:900])
+        return _fallback_unknown()
+
+    log(f"Total ASK time {time.time() - overall_t0:.2f}s")
+    log("=" * 60)
+    return arr
+
+
+# =========================
+# PUBLIC: RED FLAG ANALYSIS
+# =========================
+def red_flag_analysis_from_faiss(ticker: str) -> Dict[str, Any]:
+    overall_t0 = time.time()
+    ticker = (ticker or "").strip().upper()
+
+    log("=" * 60)
+    log(f"REDFLAG ticker={ticker}")
+
+    if not ticker:
+        raise ValueError("ticker is required")
+
+    row = _get_s1_row(ticker)
+    if not row:
+        raise ValueError(f"Ticker '{ticker}' not found in IPOS1DealData")
+
+    if not _is_faiss_ready(ticker):
+        raise ValueError(f"No FAISS index found for '{ticker}'. Upload S-1 first.")
+
+    company_name = getattr(row, "company_name", "") or ticker
+    vs = _load_faiss_index_cached(ticker)
+
+    risk_categories = [
+        "Financial Stability & Solvency Risk",
+        "Liquidity & Funding Risk",
+        "Profitability & Margin Adequacy Risk",
+        "Earnings Quality & Accounting Risk",
+        "Cash Flow Sustainability & Conversion Risk",
+        "Working Capital Risk",
+        "Leverage, Covenant & Refinancing Risk",
+        "Capital Allocation & Dilution Risk",
+        "Revenue Concentration & Dependency Risk",
+        "Regulatory & Compliance Risk",
+        "Legal, Litigation & Contractual Risk",
+        "Governance, Control & Related-Party Risk",
+        "Management Capability & Key-Man Risk",
+        "Competitive Intensity & Industry Structure Risk",
+        "Valuation Multiple Compression Risk",
+    ]
+
+    seen_hash = set()
+    collected = []
+
+    t_retrieve = time.time()
+    for cat in risk_categories:
+        hits = vs.similarity_search(cat, k=RF_PER_QUERY_K)
+        for h in hits:
+            txt = (h.page_content or "").strip()
+            if not txt:
+                continue
+            sig = hash(txt[:500])
+            if sig in seen_hash:
+                continue
+            seen_hash.add(sig)
+            collected.append(h)
+
+    collected = collected[:RF_MAX_UNIQUE_CHUNKS]
+    log(f"Collected {len(collected)} unique chunks in {time.time() - t_retrieve:.2f}s")
+
+    collected.sort(key=lambda d: d.metadata.get("page") or 0)
+
+    context_blocks = []
+    for h in collected:
+        page = h.metadata.get("page")
+        txt = (h.page_content or "")[:RF_MAX_CHARS_PER_CHUNK]
+        context_blocks.append(f"(Page {page}) {txt}")
+
+    context = "\n\n".join(context_blocks)
+
+    user_prompt = (
+        f"Company Name: {company_name}\n"
+        f"Ticker: {ticker}\n\n"
+        f"CONTEXT (S-1 excerpts only):\n{context}\n\n"
+        "Return ONLY the strict JSON object schema."
+    )
+
+    raw = _perplexity_call(SYSTEM_MESSAGE_REDFLAG_JSON, user_prompt, max_tokens=PERPLEXITY_MAX_TOKENS_RF)
+    out = _try_repair_json_object(raw)
+
+    if out is None:
+        fix_prompt = user_prompt + "\n\nIMPORTANT: Your previous output was invalid JSON. Return ONLY valid JSON object now."
+        raw2 = _perplexity_call(SYSTEM_MESSAGE_REDFLAG_JSON, fix_prompt, max_tokens=PERPLEXITY_MAX_TOKENS_RF)
+        out = _try_repair_json_object(raw2)
+        if out is None:
+            log("Redflag invalid JSON after 2 attempts (first 1200 chars):")
+            log((raw2 or "")[:1200])
+            raise ValueError("Model returned invalid JSON for redflag analysis.")
+
+    if not isinstance(out, dict):
+        raise ValueError("Redflag output is not a JSON object.")
+
+    log(f"Total REDFLAG time {time.time() - overall_t0:.2f}s")
+    log("=" * 60)
+    return out
+
+
+
+# app/helpers/red_flag_analysis.py
+from typing import Any, Dict, Tuple, Optional
+
+from django.db import transaction
+from rest_framework import status
+
+from ..models import IPOS1DealData
+
+
+def post_red_flag_analysis(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
+    """
+    POST
+    Input:  {"ticker_name": "SPYG"}   OR {"ticker": "SPYG"}  (supports both)
+    Output: {"ticker_name": "...", "red_flag_analysis": {...}} (or null)
+    """
+
+    # accept either ticker_name or ticker from request
+    ticker, err, code = _require_str(payload, "ticker_name")
+    if err:
+        ticker, err, code = _require_str(payload, "ticker")
+        if err:
+            return {"detail": "Provide 'ticker_name' (preferred) or 'ticker'."}, status.HTTP_400_BAD_REQUEST
+
+    obj = IPOS1DealData.objects.filter(ticker_name=ticker).first()
+    if not obj:
+        return (
+            {"detail": f"IPOS1DealData not found for ticker_name='{ticker}'"},
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    return (
+        {"ticker_name": obj.ticker_name, "red_flag_analysis": obj.red_flag_analysis},
+        status.HTTP_200_OK,
+    )
+
+
+
+def _require_str(data: Dict[str, Any], key: str) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[int]]:
+    val = data.get(key)
+    if val is None:
+        return None, {"detail": f"'{key}' is required."}, status.HTTP_400_BAD_REQUEST
+    if not isinstance(val, str) or not val.strip():
+        return None, {"detail": f"'{key}' must be a non-empty string."}, status.HTTP_400_BAD_REQUEST
+    return val.strip(), None, None
+
+
+def _get_ticker(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[int]]:
+    ticker, err, code = _require_str(payload, "ticker")
+    if not err:
+        return ticker, None, None
+    ticker, err2, code2 = _require_str(payload, "ticker_name")
+    if not err2:
+        return ticker, None, None
+    return None, {"detail": "Provide 'ticker' or 'ticker_name'."}, status.HTTP_400_BAD_REQUEST
+
+
+def _require_dict(data: Dict[str, Any], key: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[int]]:
+    val = data.get(key)
+    if val is None:
+        return None, {"detail": f"'{key}' is required."}, status.HTTP_400_BAD_REQUEST
+    if not isinstance(val, dict):
+        return None, {"detail": f"'{key}' must be an object/dict."}, status.HTTP_400_BAD_REQUEST
+    return val, None, None
+
+
+def _require_list_of_str(payload: Dict[str, Any], key: str) -> Tuple[Optional[List[str]], Optional[Dict[str, Any]], Optional[int]]:
+    val = payload.get(key)
+    if val is None:
+        return None, {"detail": f"'{key}' is required."}, status.HTTP_400_BAD_REQUEST
+    if not isinstance(val, list) or not all(isinstance(x, str) and x.strip() for x in val):
+        return None, {"detail": f"'{key}' must be a list of non-empty strings."}, status.HTTP_400_BAD_REQUEST
+    return [x.strip() for x in val], None, None
+
+
+def _require_updates(payload: Dict[str, Any]) -> Tuple[Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]], Optional[int]]:
+    updates = payload.get("updates")
+    if updates is None:
+        return None, {"detail": "'updates' is required."}, status.HTTP_400_BAD_REQUEST
+    if not isinstance(updates, list) or not updates:
+        return None, {"detail": "'updates' must be a non-empty list."}, status.HTTP_400_BAD_REQUEST
+
+    normalized: List[Dict[str, Any]] = []
+    for i, u in enumerate(updates):
+        if not isinstance(u, dict):
+            return None, {"detail": f"updates[{i}] must be an object."}, status.HTTP_400_BAD_REQUEST
+
+        cat = u.get("category")
+        if not isinstance(cat, str) or not cat.strip():
+            return None, {"detail": f"updates[{i}].category must be a non-empty string."}, status.HTTP_400_BAD_REQUEST
+
+        ch = u.get("changes")
+        if not isinstance(ch, dict):
+            return None, {"detail": f"updates[{i}].changes must be an object/dict."}, status.HTTP_400_BAD_REQUEST
+
+        normalized.append({"category": cat.strip(), "changes": ch})
+
+    return normalized, None, None
+
+
+@transaction.atomic
+def patch_red_flag_analysis(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
+    """
+    Supports:
+      A) root_changes (top-level JSON keys)
+      B) bulk updates: {"updates":[{category, changes}, ...]}
+      C) single category update: {"category": "...", "changes": {...}}
+      D) delete: {"action":"delete", "category": "..."} or {"categories":[...]}
+    """
+    ticker, err, code = _get_ticker(payload)
+    if err:
+        return err, code
+
+    obj = IPOS1DealData.objects.select_for_update().filter(ticker_name=ticker).first()
+    if not obj:
+        return {"detail": f"IPOS1DealData not found for ticker_name='{ticker}'"}, status.HTTP_404_NOT_FOUND
+
+    if not obj.red_flag_analysis:
+        return {"detail": "red_flag_analysis is null/empty; nothing to patch."}, status.HTTP_400_BAD_REQUEST
+
+    rfa = obj.red_flag_analysis
+    action = payload.get("action", "update")
+
+    # -------------------------
+    # A) ROOT UPDATE
+    # -------------------------
+    if "root_changes" in payload:
+        root_changes, err, code = _require_dict(payload, "root_changes")
+        if err:
+            return err, code
+
+        rfa.update(root_changes)
+        obj.red_flag_analysis = rfa
+        obj.save(update_fields=["red_flag_analysis"])
+
+        return (
+            {
+                "ticker_name": obj.ticker_name,
+                "message": "Root fields updated successfully.",
+                "updated_root_keys": list(root_changes.keys()),
+                "red_flag_analysis": obj.red_flag_analysis,
+            },
+            status.HTTP_200_OK,
+        )
+
+    # Need data for category ops
+    data_list = rfa.get("data")
+    if not isinstance(data_list, list):
+        return {"detail": "red_flag_analysis['data'] is missing or not a list."}, status.HTTP_400_BAD_REQUEST
+
+    # -------------------------
+    # D) DELETE (single or multiple)
+    # -------------------------
+    if action == "delete":
+        if "categories" in payload:
+            categories, err, code = _require_list_of_str(payload, "categories")
+            if err:
+                return err, code
+        else:
+            category, err, code = _require_str(payload, "category")
+            if err:
+                return err, code
+            categories = [category]
+
+        cat_set = set(categories)
+        before = len(data_list)
+        new_list = [
+            item for item in data_list
+            if not (isinstance(item, dict) and item.get("category") in cat_set)
+        ]
+        deleted_count = before - len(new_list)
+
+        if deleted_count == 0:
+            return {"detail": "No matching categories found to delete.", "requested": categories}, status.HTTP_404_NOT_FOUND
+
+        rfa["data"] = new_list
+        obj.red_flag_analysis = rfa
+        obj.save(update_fields=["red_flag_analysis"])
+
+        return (
+            {
+                "ticker_name": obj.ticker_name,
+                "message": "Category deletion completed.",
+                "deleted_count": deleted_count,
+                "requested_categories": categories,
+                "red_flag_analysis": obj.red_flag_analysis,
+            },
+            status.HTTP_200_OK,
+        )
+
+    # -------------------------
+    # B) BULK UPDATE (your payload)
+    # -------------------------
+    if "updates" in payload:
+        updates, err, code = _require_updates(payload)
+        if err:
+            return err, code
+
+        updated_items_count = 0
+        updated_categories: List[str] = []
+        not_found: List[str] = []
+
+        # Apply each update IN ORDER.
+        # If category appears multiple times (like your "Regulatory Risks"),
+        # it will be updated multiple times; last one wins.
+        for upd in updates:
+            cat = upd["category"]
+            changes = upd["changes"]
+
+            matched = False
+            for i, item in enumerate(data_list):
+                if isinstance(item, dict) and item.get("category") == cat:
+                    matched = True
+                    new_item = dict(item)
+                    new_item.update(changes)
+                    data_list[i] = new_item
+                    updated_items_count += 1
+
+            if matched:
+                updated_categories.append(cat)
+            else:
+                not_found.append(cat)
+
+        if updated_items_count == 0:
+            return (
+                {"detail": "No matching categories found to update.", "not_found_categories": not_found},
+                status.HTTP_404_NOT_FOUND,
+            )
+
+        rfa["data"] = data_list
+        obj.red_flag_analysis = rfa
+        obj.save(update_fields=["red_flag_analysis"])
+
+        return (
+            {
+                "ticker_name": obj.ticker_name,
+                "message": "Bulk update completed.",
+                "updated_items_count": updated_items_count,
+                "updated_categories_in_order": updated_categories,
+                "not_found_categories": not_found,
+                "red_flag_analysis": obj.red_flag_analysis,
+            },
+            status.HTTP_200_OK,
+        )
+
+    # -------------------------
+    # C) SINGLE CATEGORY UPDATE (fallback)
+    # -------------------------
+    category, err, code = _require_str(payload, "category")
+    if err:
+        return err, code
+
+    changes, err, code = _require_dict(payload, "changes")
+    if err:
+        return err, code
+
+    target_idx: Optional[int] = None
+    for i, item in enumerate(data_list):
+        if isinstance(item, dict) and item.get("category") == category:
+            target_idx = i
+            break
+
+    if target_idx is None:
+        return {"detail": f"No item found for category='{category}'."}, status.HTTP_404_NOT_FOUND
+
+    updated_item = dict(data_list[target_idx])
+    updated_item.update(changes)
+    data_list[target_idx] = updated_item
+
+    rfa["data"] = data_list
+    obj.red_flag_analysis = rfa
+    obj.save(update_fields=["red_flag_analysis"])
+
+    return (
+        {
+            "ticker_name": obj.ticker_name,
+            "message": "Category updated successfully.",
+            "category": category,
+            "updated_keys": list(changes.keys()),
+            "red_flag_analysis": obj.red_flag_analysis,
+        },
+        status.HTTP_200_OK,
+    )
